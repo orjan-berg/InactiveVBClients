@@ -22,36 +22,35 @@ Ensure-Module -ModuleName 'SqlServer'
 Ensure-Module -ModuleName 'ImportExcel'
 
 # SQL Server connection details
-$serverName = '192.168.50.44'
+$serverName = 'vm-vbpl1910\visma,50029'
 $databases = @()
 
-# Function to execute a SQL query
+# Function to execute a SQL query (simplified to throw errors)
+# Function to execute a SQL query (REVISED)
 function Execute-Query {
     param (
         [string]$ServerInstance,
-        [string]$DatabaseName,
+        # DatabaseName-parameteren er ikke lenger nødvendig her, men vi lar den stå
+        # i tilfelle du trenger den til noe annet senere.
+        [string]$DatabaseName, 
         [string]$Query,
         [string]$UserName = $null,
         [string]$Password = $null
     )
 
-    try {
-        if ($UserName -and $Password) {
-            # SQL Server authentication
-            $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
-            $credential = New-Object System.Management.Automation.PSCredential ($UserName, $securePassword)
-            return Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $DatabaseName -Query $Query -Credential $credential -TrustServerCertificate
-        } else {
-            # Windows authentication
-            return Invoke-Sqlcmd -ServerInstance $ServerInstance -Database $DatabaseName -Query $Query
-        }
-    } catch {
-        Write-Error "Failed to execute query: $_"
-        return $null
+    if ($UserName -and $Password) {
+        # SQL Server authentication
+        $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential ($UserName, $securePassword)
+        # FJERNERT '-Database $DatabaseName' fra linjen under
+        return Invoke-Sqlcmd -ServerInstance $ServerInstance -Query $Query -Credential $credential -TrustServerCertificate -ErrorAction Stop
+    } else {
+        # Windows authentication
+        # FJERNERT '-Database $DatabaseName' fra linjen under
+        return Invoke-Sqlcmd -ServerInstance $ServerInstance -Query $Query -TrustServerCertificate -ErrorAction Stop
     }
 }
-
-# Attempt to retrieve all databases that start with 'F' followed by 4 or more digits using Windows authentication
+# Attempt to retrieve all databases that start with 'F' followed by 4 or more digits
 try {
     $databases = Invoke-Sqlcmd -ServerInstance $serverName -TrustServerCertificate -Query "SELECT name FROM sys.databases WHERE name LIKE 'F[0-9][0-9][0-9][0-9]%'" | Select-Object -ExpandProperty name
 } catch {
@@ -63,7 +62,6 @@ try {
     $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($sqlPassword))
 
     try {
-        # Attempt to retrieve databases using SQL Server authentication
         $databases = Invoke-Sqlcmd -ServerInstance $serverName -TrustServerCertificate -Query "SELECT name FROM sys.databases WHERE name LIKE 'F[0-9][0-9][0-9][0-9]%'" -Username $sqlUser -Password $plainPassword | Select-Object -ExpandProperty name
     } catch {
         Write-Error 'SQL Server authentication failed. Please check your credentials.'
@@ -78,41 +76,43 @@ $results = @()
 foreach ($dbName in $databases) {
     Write-Host "Processing database: $dbName"
 
-    # Define the SQL query
     $query = @"
     SELECT 
         '$dbName' AS DatabaseName,
-        'UpdBnd' AS TableName,
-        MAX(ChDt) AS MaxChDt
-    FROM $dbName.dbo.UpdBnd
-    UNION ALL
-    SELECT 
-        '$dbName' AS DatabaseName,
-        'Ord' AS TableName,
-        MAX(ChDt) AS MaxChDt
-    FROM $dbName.dbo.Ord
-    UNION ALL
-    SELECT 
-        '$dbName' AS DatabaseName,
-        'ProdTr' AS TableName,
-        MAX(ChDt) AS MaxChDt
-    FROM $dbName.dbo.ProdTr
+        (SELECT MAX(ChDt) FROM [$dbName].[dbo].[UpdBnd]) AS UpdBnd_MaxChDt,
+        (SELECT MAX(ChDt) FROM [$dbName].[dbo].[Ord]) AS Ord_MaxChDt,
+        (SELECT MAX(ChDt) FROM [$dbName].[dbo].[ProdTr]) AS ProdTr_MaxChDt
 "@
+    
+    try {
+        # Execute the query for the current database
+        if ($sqlUser -and $plainPassword) {
+            $queryResult = Execute-Query -ServerInstance $serverName -DatabaseName $dbName -Query $query -UserName $sqlUser -Password $plainPassword
+        } else {
+            $queryResult = Execute-Query -ServerInstance $serverName -DatabaseName $dbName -Query $query
+        }
 
-    # Execute the query and store the results
-    if ($sqlUser -and $plainPassword) {
-        $queryResult = Execute-Query -ServerInstance $serverName -DatabaseName $dbName -TrustServerCertificate -Query $query -UserName $sqlUser -Password $plainPassword
-    } else {
-        $queryResult = Execute-Query -ServerInstance $serverName -DatabaseName $dbName -Query $query -TrustServerCertificate
-    }
+        # *** NYTT: Sjekker om resultatet er tomt og gir en advarsel ***
+        if ($queryResult -and ($null -eq $queryResult.UpdBnd_MaxChDt -and $null -eq $queryResult.Ord_MaxChDt -and $null -eq $queryResult.ProdTr_MaxChDt)) {
+            Write-Warning "Database '$dbName' returnerte ingen datoer (tomme tabeller eller kun NULL-verdier)."
+        }
 
-    if ($queryResult) {
-        $results += $queryResult
+        # Add the result to the array (even if dates are null)
+        if ($queryResult) {
+            $results += $queryResult
+        }
+
+    } catch {
+        # *** NYTT: Fanger opp feil for én spesifikk database og fortsetter med neste ***
+        Write-Error "Kunne ikke hente data for '$dbName'. Feil: $($_.Exception.Message)"
     }
 }
 
 # Convert results to Excel
-$excelPath = '\\192.168.50.83\I$\InactiveVBClients\DatabasesResults.xlsx'
-$results | Export-Excel -Path $excelPath -AutoSize -WorksheetName 'QueryResults'
-
-Write-Host "Results have been exported to $excelPath"
+if ($results.Count -gt 0) {
+    $excelPath = 'c:\temp\InactiveVBClients\DatabasesResults.xlsx'
+    $results | Export-Excel -Path $excelPath -AutoSize -WorksheetName 'QueryResults'
+    Write-Host "Results have been exported to $excelPath"
+} else {
+    Write-Warning 'Ingen data ble hentet. Excel-fil ble ikke opprettet.'
+}
